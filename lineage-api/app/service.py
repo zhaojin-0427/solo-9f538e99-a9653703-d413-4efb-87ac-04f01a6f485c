@@ -11,6 +11,7 @@ from .exceptions import (
     ConflictLineageError,
     CycleDetectedError,
     NotFoundLineageError,
+    RetiredNameError,
     ValidationLineageError,
 )
 
@@ -174,6 +175,46 @@ def register_batch(
                 {"kind_conflicts": conflicts},
             )
 
+        # ---- retired (renamed-away) names must not be created or referenced ----
+        # Checked under the write lock, so a concurrent rename cannot slip a
+        # name into retirement between this check and the upsert below.
+        retired: dict[str, str] = {
+            row["name"]: row["renamed_to"]
+            for row in conn.execute(
+                "SELECT name, renamed_to FROM retired_names"
+            )
+        }
+        if retired:
+            retired_nodes = sorted(
+                {node.name for node in payload_nodes if node.name in retired}
+            )
+            retired_inputs: dict[str, list[str]] = {}
+            for node in payload_nodes:
+                hits = sorted(
+                    {
+                        inp
+                        for group in node.candidate_groups
+                        for inp in group
+                        if inp in retired
+                    }
+                )
+                if hits:
+                    retired_inputs[node.name] = hits
+            if retired_nodes or retired_inputs:
+                all_hits = set(retired_nodes) | {
+                    inp for hits in retired_inputs.values() for inp in hits
+                }
+                raise RetiredNameError(
+                    "批次创建或引用了已停用名（源字段更名后退役），整批未生效",
+                    {
+                        "retired_nodes": retired_nodes,
+                        "retired_inputs": retired_inputs,
+                        "renamed_to": {
+                            name: retired[name] for name in sorted(all_hits)
+                        },
+                    },
+                )
+
         # ---- referential integrity against post-batch node set ----
         final_nodes = dict(existing_kinds)
         for node in payload_nodes:
@@ -249,6 +290,89 @@ def register_batch(
 
 
 # --------------------------------------------------------------------------- #
+# Source field rename (atomic migration of the node and every reference)
+# --------------------------------------------------------------------------- #
+
+def rename_source(
+    old_name: str, new_name: str, db_path: str | None = None
+) -> dict:
+    """Rename a source field and migrate all candidate-group references.
+
+    Runs in the same serialised write transaction as registration, so
+    concurrent readers only ever see the full pre- or post-rename state.
+    The old name is recorded in ``retired_names`` and can never be
+    re-registered or referenced again.
+    """
+    if old_name == new_name:
+        raise ValidationLineageError(
+            "新旧字段名相同，无需更名",
+            {"old_name": old_name, "new_name": new_name},
+        )
+
+    with db.immediate_write(db_path) as conn:
+        row = conn.execute(
+            "SELECT kind FROM nodes WHERE name = ?", (old_name,)
+        ).fetchone()
+        if row is None:
+            details: dict = {"old_name": old_name}
+            retired_to = conn.execute(
+                "SELECT renamed_to FROM retired_names WHERE name = ?",
+                (old_name,),
+            ).fetchone()
+            if retired_to is not None:
+                details["renamed_to"] = retired_to["renamed_to"]
+                raise NotFoundLineageError(
+                    "旧字段名已停用（此前已更名），血缘未改变", details
+                )
+            raise NotFoundLineageError("旧字段名不存在，血缘未改变", details)
+
+        if row["kind"] != "source":
+            raise ConflictLineageError(
+                "仅源字段支持更名，血缘未改变",
+                {"old_name": old_name, "kind": row["kind"]},
+            )
+
+        if conn.execute(
+            "SELECT 1 FROM nodes WHERE name = ?", (new_name,)
+        ).fetchone():
+            raise ConflictLineageError(
+                "新字段名已被占用，血缘未改变", {"new_name": new_name}
+            )
+        if conn.execute(
+            "SELECT 1 FROM retired_names WHERE name = ?", (new_name,)
+        ).fetchone():
+            raise ConflictLineageError(
+                "新字段名是已停用名，血缘未改变", {"new_name": new_name}
+            )
+
+        # Insert the new node first so every foreign key stays valid at each
+        # step, then migrate references, then remove the old node row.
+        conn.execute(
+            "INSERT INTO nodes(name, kind) VALUES(?, ?)", (new_name, "source")
+        )
+        group_rows = conn.execute(
+            "UPDATE candidate_groups SET node_name = ? WHERE node_name = ?",
+            (new_name, old_name),
+        ).rowcount
+        input_rows = conn.execute(
+            "UPDATE group_inputs SET input_name = ? WHERE input_name = ?",
+            (new_name, old_name),
+        ).rowcount
+        conn.execute("DELETE FROM nodes WHERE name = ?", (old_name,))
+        conn.execute(
+            "INSERT INTO retired_names(name, renamed_to) VALUES(?, ?)",
+            (old_name, new_name),
+        )
+
+    return {
+        "old_name": old_name,
+        "new_name": new_name,
+        "updated_references": group_rows + input_rows,
+        "message": "源字段已更名，全部引用已迁移，旧名已停用",
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Recursive impact analysis
 # --------------------------------------------------------------------------- #
 
@@ -257,12 +381,21 @@ def analyze_impact(
 ) -> dict:
     with db.snapshot(db_path) as conn:
         kinds, groups = load_graph(conn)
+        retired: dict[str, str] = {
+            row["name"]: row["renamed_to"]
+            for row in conn.execute(
+                "SELECT name, renamed_to FROM retired_names"
+            )
+        }
 
     unknown = sorted(name for name in retiring if name not in kinds)
     if unknown:
-        raise NotFoundLineageError(
-            "存在未登记的字段名", {"unknown": unknown}
-        )
+        details: dict = {"unknown": unknown}
+        renamed = {name: retired[name] for name in unknown if name in retired}
+        if renamed:
+            # Retired old names point the caller at the current name.
+            details["renamed"] = renamed
+        raise NotFoundLineageError("存在未登记的字段名", details)
 
     retiring_set = set(retiring)
     sys.setrecursionlimit(_MAX_RECURSION_DEPTH)
@@ -347,6 +480,17 @@ def analyze_impact(
 def get_graph(db_path: str | None = None) -> dict:
     with db.snapshot(db_path) as conn:
         kinds, groups = load_graph(conn)
+        retired = [
+            {
+                "name": row["name"],
+                "renamed_to": row["renamed_to"],
+                "retired_at": row["retired_at"],
+            }
+            for row in conn.execute(
+                "SELECT name, renamed_to, retired_at FROM retired_names "
+                "ORDER BY retired_at, name"
+            )
+        ]
     nodes = [
         {
             "name": name,
@@ -358,4 +502,4 @@ def get_graph(db_path: str | None = None) -> dict:
     counts: dict[str, int] = {"source": 0, "derived": 0, "report": 0}
     for kind in kinds.values():
         counts[kind] += 1
-    return {"nodes": nodes, "counts": counts}
+    return {"nodes": nodes, "counts": counts, "retired_names": retired}

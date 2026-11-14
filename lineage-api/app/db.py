@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS group_inputs (
     PRIMARY KEY (group_id, input_name)
 );
 
+CREATE TABLE IF NOT EXISTS retired_names (
+    name        TEXT PRIMARY KEY,
+    renamed_to  TEXT NOT NULL,
+    retired_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_groups_node
     ON candidate_groups(node_name);
 CREATE INDEX IF NOT EXISTS idx_inputs_group

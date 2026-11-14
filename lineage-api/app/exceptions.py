@@ -25,6 +25,10 @@ class CycleDetectedError(ConflictLineageError):
     code = "cycle_detected"
 
 
+class RetiredNameError(ConflictLineageError):
+    code = "retired_name"
+
+
 class NotFoundLineageError(LineageError):
     status_code = 404
     code = "not_found"

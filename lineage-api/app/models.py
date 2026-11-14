@@ -67,6 +67,27 @@ class NodeOut(BaseModel):
     candidate_groups: list[list[str]]
 
 
+class RetiredNameOut(BaseModel):
+    name: str
+    renamed_to: str
+    retired_at: str
+
+
 class GraphResponse(BaseModel):
     nodes: list[NodeOut]
     counts: dict[str, int]
+    retired_names: list[RetiredNameOut] = Field(default_factory=list)
+
+
+class RenameRequest(BaseModel):
+    old_name: str = Field(..., min_length=1, description="待更名的源字段旧名")
+    new_name: str = Field(
+        ..., min_length=1, description="新字段名（须未被占用且非停用名）"
+    )
+
+
+class RenameResponse(BaseModel):
+    old_name: str
+    new_name: str
+    updated_references: int = Field(description="迁移的候选组引用条数")
+    message: str

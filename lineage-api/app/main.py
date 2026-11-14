@@ -17,6 +17,8 @@ from .models import (
     ImpactResponse,
     RegisterRequest,
     RegisterResponse,
+    RenameRequest,
+    RenameResponse,
 )
 
 
@@ -31,9 +33,9 @@ app = FastAPI(
     title="数据血缘影响分析 API",
     description=(
         "批量登记源字段 / 派生字段 / 报表列依赖，提交拟下线字段后递归分析"
-        "确实失效的报表列及各候选组缺失依赖。"
+        "确实失效的报表列及各候选组缺失依赖；支持源字段更名（旧名停用）。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -83,6 +85,16 @@ def health() -> dict:
 def register(payload: RegisterRequest) -> dict:
     """批量登记 / 覆盖血缘；循环依赖或校验失败时整批不生效。"""
     return service.register_batch(payload.nodes)
+
+
+@app.post(
+    "/lineage/rename",
+    response_model=RenameResponse,
+    tags=["lineage"],
+)
+def rename(payload: RenameRequest) -> dict:
+    """源字段更名：一次迁移源字段及所有候选组引用，旧名转为停用名。"""
+    return service.rename_source(payload.old_name, payload.new_name)
 
 
 @app.post(
